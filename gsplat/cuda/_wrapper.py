@@ -1546,7 +1546,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             camera_model != "ftheta"
         ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
 
-        ctx.set_materialize_grads(True)
+        # ctx.set_materialize_grads(True)
 
         # "covars" and {"quats", "scales"} are mutually exclusive
         radii, means2d, depths, conics, compensations = projection_ewa_3dgs_fused_fwd(
