@@ -263,6 +263,17 @@ def rasterization(
         'flatten_ids', 'isect_offsets', 'width', 'height', 'tile_size'])
 
     """
+    # Ensure width/height are Python ints for torch.compile (avoids data-dependent
+    # operator and data-dependent branching when callers pass tensor elements).
+    if isinstance(width, torch.Tensor):
+        width = int(width.item())
+    else:
+        width = int(width)
+    if isinstance(height, torch.Tensor):
+        height = int(height.item())
+    else:
+        height = int(height)
+
     meta = {}
 
     batch_dims = means.shape[:-2]
