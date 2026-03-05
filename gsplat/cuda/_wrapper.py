@@ -910,7 +910,6 @@ def fully_fused_projection(
             camera_model,
             opacities,
         )
-        means2d = means2d + radii * 1e-8
         return radii, means2d, depths, conics, compensations
 
 
@@ -1547,6 +1546,8 @@ class _FullyFusedProjection(torch.autograd.Function):
             camera_model != "ftheta"
         ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
 
+        ctx.set_materialize_grads(True)
+
         # "covars" and {"quats", "scales"} are mutually exclusive
         radii, means2d, depths, conics, compensations = projection_ewa_3dgs_fused_fwd(
             means,
@@ -1575,6 +1576,8 @@ class _FullyFusedProjection(torch.autograd.Function):
         ctx.eps2d = eps2d
         ctx.camera_model = camera_model
 
+        # radii = radii.float()
+        ctx.mark_non_differentiable(radii)
         return radii, means2d, depths, conics, compensations
 
     @staticmethod
@@ -1596,6 +1599,7 @@ class _FullyFusedProjection(torch.autograd.Function):
         camera_model = ctx.camera_model
         if v_compensations is not None:
             v_compensations = v_compensations.contiguous()
+        # v_means2d = v_means2d + (v_radii.sum() * 0)
         v_means, v_covars, v_quats, v_scales, v_viewmats = projection_ewa_3dgs_fused_bwd(
             means,
             covars,
