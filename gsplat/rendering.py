@@ -13,13 +13,15 @@ from .cuda._wrapper import (
     FThetaPolynomialType,
     fully_fused_projection,
     fully_fused_projection_2dgs,
+    fully_fused_projection_compiled,
     fully_fused_projection_with_ut,
     isect_offset_encode,
     isect_tiles,
-    rasterize_to_pixels,
     rasterize_to_pixels_2dgs,
+    rasterize_to_pixels_compiled,
     rasterize_to_pixels_eval3d,
     spherical_harmonics,
+    spherical_harmonics_compiled,
 )
 from .distributed import (
     all_gather_int32,
@@ -417,25 +419,44 @@ def rasterization(
 
     else:
         # Project Gaussians to 2D. Directly pass in {quats, scales} is faster than precomputing covars.
-        proj_results = fully_fused_projection(
-            means,
-            covars,
-            quats,
-            scales,
-            viewmats,
-            Ks,
-            width,
-            height,
-            eps2d=eps2d,
-            packed=packed,
-            near_plane=near_plane,
-            far_plane=far_plane,
-            radius_clip=radius_clip,
-            sparse_grad=sparse_grad,
-            calc_compensations=(rasterize_mode == "antialiased"),
-            camera_model=camera_model,
-            opacities=opacities,  # use opacities to compute a tigher bound for radii.
-        )
+        if packed:
+            proj_results = fully_fused_projection(
+                means,
+                covars,
+                quats,
+                scales,
+                viewmats,
+                Ks,
+                width,
+                height,
+                eps2d=eps2d,
+                packed=True,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                radius_clip=radius_clip,
+                sparse_grad=sparse_grad,
+                calc_compensations=(rasterize_mode == "antialiased"),
+                camera_model=camera_model,
+                opacities=opacities,  # use opacities to compute a tigher bound for radii.
+            )
+        else:
+            proj_results = fully_fused_projection_compiled(
+                means,
+                covars,
+                quats,
+                scales,
+                viewmats,
+                Ks,
+                width,
+                height,
+                eps2d=eps2d,
+                near_plane=near_plane,
+                far_plane=far_plane,
+                radius_clip=radius_clip,
+                calc_compensations=(rasterize_mode == "antialiased"),
+                camera_model=camera_model,
+                opacities=opacities,
+            )
 
     if packed:
         # The results are packed into shape [nnz, ...]. All elements are valid.
@@ -517,7 +538,7 @@ def rasterization(
                 shs = colors.view(B, C, N, -1, 3)[
                     batch_ids, camera_ids, gaussian_ids
                 ]  # [nnz, K, 3]
-            colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
+            colors = spherical_harmonics_compiled(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
         else:
             dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
             masks = (radii > 0).all(dim=-1)  # [..., C, N]
@@ -529,7 +550,7 @@ def rasterization(
             else:
                 # colors is already [..., C, N, K, 3]
                 shs = colors
-            colors = spherical_harmonics(
+            colors = spherical_harmonics_compiled(
                 sh_degree, dirs, shs, masks=masks
             )  # [..., C, N, 3]
         # make it apple-to-apple with Inria's CUDA Backend.
@@ -711,7 +732,7 @@ def rasterization(
                     viewmats_rs=viewmats_rs,
                 )
             else:
-                render_colors_, render_alphas_ = rasterize_to_pixels(
+                render_colors_, render_alphas_ = rasterize_to_pixels_compiled(
                     means2d,
                     conics,
                     colors_chunk,
@@ -754,7 +775,7 @@ def rasterization(
                 viewmats_rs=viewmats_rs,
             )
         else:
-            render_colors, render_alphas = rasterize_to_pixels(
+            render_colors, render_alphas = rasterize_to_pixels_compiled(
                 means2d,
                 conics,
                 colors,
@@ -927,7 +948,7 @@ def _rasterization(
         else:
             # colors is already [..., C, N, K, 3]
             shs = colors
-        colors = spherical_harmonics(
+        colors = spherical_harmonics_compiled(
             sh_degree, dirs, shs, masks=masks
         )  # [..., C, N, 3]
         # make it apple-to-apple with Inria's CUDA Backend.
