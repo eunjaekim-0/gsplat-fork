@@ -9,21 +9,6 @@ from torch import Tensor
 from typing_extensions import Literal
 
 
-# Kernels that take a CameraModelType enum; value is the 0-based arg index (-1 = last).
-# We pass the camera model as a string so Dynamo can trace it; convert to enum here.
-_CAMERA_MODEL_ARG_INDEX = {
-    "projection_ewa_simple_fwd": 5,
-    "projection_ewa_simple_bwd": 5,
-    "projection_ewa_3dgs_fused_fwd": 14,
-    "projection_ewa_3dgs_fused_bwd": 9,
-    "projection_ut_3dgs_fused": 14,
-    "projection_ewa_3dgs_packed_fwd": 14,
-    "projection_ewa_3dgs_packed_bwd": 9,
-    "rasterize_to_pixels_from_world_3dgs_fwd": 13,
-    "rasterize_to_pixels_from_world_3dgs_bwd": 13,
-}
-
-
 def _any_meta_or_fake_tensor(*args, **kwargs):
     """True if any tensor in args/kwargs is on meta or is a FakeTensor (tracing context)."""
     def check(x):
@@ -467,27 +452,12 @@ def _(isect_ids, I, tile_width, tile_height):
     return torch.empty((I, tile_height, tile_width), dtype=torch.int32, device=isect_ids.device)
 
 
-@torch.compiler.allow_in_graph
-def _call_cuda_allow_in_graph(name: str, *args, **kwargs):
-    """Single entry point for C++ pybind calls so Dynamo keeps them in the graph."""
-    # pylint: disable=import-outside-toplevel
-    from ._backend import _C
-
-    if name in _CAMERA_MODEL_ARG_INDEX:
-        idx = _CAMERA_MODEL_ARG_INDEX[name]
-        args = list(args)
-        if idx < 0:
-            idx = len(args) + idx
-        cam_arg = args[idx]
-        if isinstance(cam_arg, str):
-            args[idx] = getattr(_C.CameraModelType, cam_arg.upper())
-        args = tuple(args)
-    return getattr(_C, name)(*args, **kwargs)
-
-
 def _make_lazy_cuda_func(name: str) -> Callable:
     def call_cuda(*args, **kwargs):
-        return _call_cuda_allow_in_graph(name, *args, **kwargs)
+        # pylint: disable=import-outside-toplevel
+        from ._backend import _C
+
+        return getattr(_C, name)(*args, **kwargs)
 
     return call_cuda
 
@@ -650,6 +620,35 @@ def spherical_harmonics(
         assert masks.shape == batch_dims, masks.shape
         masks = masks.contiguous()
     return _SphericalHarmonics.apply(
+        degrees_to_use, dirs.contiguous(), coeffs.contiguous(), masks
+    )
+
+
+def spherical_harmonics_compiled(
+    degrees_to_use: int,
+    dirs: Tensor,  # [..., 3]
+    coeffs: Tensor,  # [..., K, 3]
+    masks: Optional[Tensor] = None,  # [...,]
+) -> Tensor:
+    """Same as :func:`spherical_harmonics` but uses custom ops for torch.compile.
+
+    When ``masks`` is None, a placeholder tensor is used so the backward graph
+    never sees None for that gradient position.
+    """
+    assert (degrees_to_use + 1) ** 2 <= coeffs.shape[-2], coeffs.shape
+    batch_dims = dirs.shape[:-1]
+    assert dirs.shape == batch_dims + (3,), dirs.shape
+    assert (
+        (len(coeffs.shape) == len(batch_dims) + 2)
+        and coeffs.shape[:-2] == batch_dims
+        and coeffs.shape[-1] == 3
+    ), coeffs.shape
+    if masks is not None:
+        assert masks.shape == batch_dims, masks.shape
+        masks = masks.contiguous()
+    else:
+        masks = torch.ones(batch_dims, dtype=torch.bool, device=dirs.device)
+    return _SphericalHarmonicsCompiled.apply(
         degrees_to_use, dirs.contiguous(), coeffs.contiguous(), masks
     )
 
@@ -913,6 +912,69 @@ def fully_fused_projection(
         return radii, means2d, depths, conics, compensations
 
 
+def fully_fused_projection_compiled(
+    means: Tensor,  # [..., N, 3]
+    covars: Optional[Tensor],  # [..., N, 6] or None
+    quats: Optional[Tensor],  # [..., N, 4] or None
+    scales: Optional[Tensor],  # [..., N, 3] or None
+    viewmats: Tensor,  # [..., C, 4, 4]
+    Ks: Tensor,  # [..., C, 3, 3]
+    width: int,
+    height: int,
+    eps2d: float = 0.3,
+    near_plane: float = 0.01,
+    far_plane: float = 1e10,
+    radius_clip: float = 0.0,
+    calc_compensations: bool = False,
+    camera_model: Literal["pinhole", "ortho", "fisheye", "ftheta"] = "pinhole",
+    opacities: Optional[Tensor] = None,  # [..., N] or None
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Same as :func:`fully_fused_projection` (non-packed) but uses custom ops for torch.compile."""
+    batch_dims = means.shape[:-2]
+    N = means.shape[-2]
+    C = viewmats.shape[-3]
+    assert means.shape == batch_dims + (N, 3), means.shape
+    assert viewmats.shape == batch_dims + (C, 4, 4), viewmats.shape
+    assert Ks.shape == batch_dims + (C, 3, 3), Ks.shape
+    means = means.contiguous()
+    if covars is not None:
+        assert covars.shape == batch_dims + (N, 6), covars.shape
+        covars = covars.contiguous()
+    else:
+        assert quats is not None, "covars or quats is required"
+        assert scales is not None, "covars or scales is required"
+        assert quats.shape == batch_dims + (N, 4), quats.shape
+        assert scales.shape == batch_dims + (N, 3), scales.shape
+        quats = quats.contiguous()
+        scales = scales.contiguous()
+    if opacities is not None:
+        assert opacities.shape == batch_dims + (N,), opacities.shape
+        opacities = opacities.contiguous()
+    assert (
+        camera_model != "ftheta"
+    ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+    viewmats = viewmats.contiguous()
+    Ks = Ks.contiguous()
+    radii, means2d, depths, conics, compensations = _FullyFusedProjectionCompiled.apply(
+        means,
+        covars,
+        quats,
+        scales,
+        viewmats,
+        Ks,
+        width,
+        height,
+        eps2d,
+        near_plane,
+        far_plane,
+        radius_clip,
+        calc_compensations,
+        camera_model,
+        opacities,
+    )
+    return radii, means2d, depths, conics, compensations
+
+
 @torch.no_grad()
 def isect_tiles(
     means2d: Tensor,  # [..., N, 2] or [nnz, 2]
@@ -1129,28 +1191,6 @@ def rasterize_to_pixels(
         tile_width * tile_size >= image_width
     ), f"Assert Failed: {tile_width} * {tile_size} >= {image_width}"
 
-    # Never pass None for backgrounds so Dynamo sees a Tensor at position 4 (avoids
-    # "Grad of non-Tensor arg Proxy(v_backgrounds) is not None" during trace).
-    if backgrounds is None:
-        _placeholder = torch.zeros(
-            means2d.shape[:-2] + (1, 1, colors.shape[-1]),
-            device=device,
-            dtype=colors.dtype,
-        )
-        setattr(_placeholder, "_is_gsplat_backgrounds_placeholder", True)
-        backgrounds = _placeholder
-
-    # Never pass None for masks so compiled backward never sees None at index 27 (v_masks).
-    # Use bool placeholder so C++ (and compiled path) never sees Float where Bool is expected.
-    if masks is None:
-        _mask_ph = torch.zeros(
-            isect_offsets.shape,
-            device=device,
-            dtype=torch.bool,
-        )
-        setattr(_mask_ph, "_is_gsplat_masks_placeholder", True)
-        masks = _mask_ph
-
     render_colors, render_alphas = _RasterizeToPixels.apply(
         means2d.contiguous(),
         conics.contiguous(),
@@ -1166,6 +1206,114 @@ def rasterize_to_pixels(
         absgrad,
     )
 
+    if padded_channels > 0:
+        render_colors = render_colors[..., :-padded_channels]
+    return render_colors, render_alphas
+
+
+def rasterize_to_pixels_compiled(
+    means2d: Tensor,  # [..., N, 2] or [nnz, 2]
+    conics: Tensor,  # [..., N, 3] or [nnz, 3]
+    colors: Tensor,  # [..., N, channels] or [nnz, channels]
+    opacities: Tensor,  # [..., N] or [nnz]
+    image_width: int,
+    image_height: int,
+    tile_size: int,
+    isect_offsets: Tensor,  # [..., tile_height, tile_width]
+    flatten_ids: Tensor,  # [n_isects]
+    backgrounds: Optional[Tensor] = None,  # [..., channels]
+    masks: Optional[Tensor] = None,  # [..., tile_height, tile_width]
+    packed: bool = False,
+    absgrad: bool = False,
+) -> Tuple[Tensor, Tensor]:
+    """Same as :func:`rasterize_to_pixels` but uses custom ops for torch.compile.
+
+    When ``backgrounds`` or ``masks`` is None, zero tensors are passed internally
+    and the C++ op is told via explicit flags so the graph is fullgraph=True-safe.
+    """
+    image_dims = means2d.shape[:-2]
+    channels = colors.shape[-1]
+    device = means2d.device
+    if packed:
+        nnz = means2d.size(0)
+        assert means2d.shape == (nnz, 2), means2d.shape
+        assert conics.shape == (nnz, 3), conics.shape
+        assert colors.shape[0] == nnz, colors.shape
+        assert opacities.shape == (nnz,), opacities.shape
+    else:
+        N = means2d.size(-2)
+        assert means2d.shape == image_dims + (N, 2), means2d.shape
+        assert conics.shape == image_dims + (N, 3), conics.shape
+        assert colors.shape == image_dims + (N, channels), colors.shape
+        assert opacities.shape == image_dims + (N,), opacities.shape
+    if backgrounds is not None:
+        assert backgrounds.shape == image_dims + (channels,), backgrounds.shape
+        backgrounds = backgrounds.contiguous()
+    if masks is not None:
+        assert masks.shape == isect_offsets.shape, masks.shape
+        masks = masks.contiguous()
+
+    if channels > 513 or channels == 0:
+        raise ValueError(f"Unsupported number of color channels: {channels}")
+    if channels not in (
+        1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 256, 257, 512, 513,
+    ):
+        padded_channels = (1 << (channels - 1).bit_length()) - channels
+        colors = torch.cat(
+            [
+                colors,
+                torch.zeros(*colors.shape[:-1], padded_channels, device=device),
+            ],
+            dim=-1,
+        )
+        if backgrounds is not None:
+            backgrounds = torch.cat(
+                [
+                    backgrounds,
+                    torch.zeros(
+                        *backgrounds.shape[:-1], padded_channels, device=device
+                    ),
+                ],
+                dim=-1,
+            )
+    else:
+        padded_channels = 0
+
+    tile_height, tile_width = isect_offsets.shape[-2:]
+    assert tile_height * tile_size >= image_height
+    assert tile_width * tile_size >= image_width
+
+    has_backgrounds = backgrounds is not None
+    has_masks = masks is not None
+    if backgrounds is None:
+        backgrounds = torch.zeros(
+            means2d.shape[:-2] + (1, 1, colors.shape[-1]),
+            device=device,
+            dtype=colors.dtype,
+        )
+    if masks is None:
+        masks = torch.zeros(
+            isect_offsets.shape,
+            device=device,
+            dtype=torch.bool,
+        )
+
+    render_colors, render_alphas = _RasterizeToPixelsCompiled.apply(
+        means2d.contiguous(),
+        conics.contiguous(),
+        colors.contiguous(),
+        opacities.contiguous(),
+        backgrounds,
+        masks,
+        image_width,
+        image_height,
+        tile_size,
+        isect_offsets.contiguous(),
+        flatten_ids.contiguous(),
+        absgrad,
+        has_backgrounds,
+        has_masks,
+    )
     if padded_channels > 0:
         render_colors = render_colors[..., :-padded_channels]
     return render_colors, render_alphas
@@ -1486,13 +1634,16 @@ class _Proj(torch.autograd.Function):
             camera_model != "ftheta"
         ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
 
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         means2d, covars2d = _make_lazy_cuda_func("projection_ewa_simple_fwd")(
             means,
             covars,
             Ks,
             width,
             height,
-            camera_model,
+            camera_model_type,
         )
         ctx.save_for_backward(means, covars, Ks)
         ctx.width = width
@@ -1506,13 +1657,16 @@ class _Proj(torch.autograd.Function):
         width = ctx.width
         height = ctx.height
         camera_model = ctx.camera_model
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         v_means, v_covars = _make_lazy_cuda_func("projection_ewa_simple_bwd")(
             means,
             covars,
             Ks,
             width,
             height,
-            camera_model,
+            camera_model_type,
             v_means2d.contiguous(),
             v_covars2d.contiguous(),
         )
@@ -1548,8 +1702,13 @@ class _FullyFusedProjection(torch.autograd.Function):
 
         # ctx.set_materialize_grads(True)
 
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         # "covars" and {"quats", "scales"} are mutually exclusive
-        radii, means2d, depths, conics, compensations = projection_ewa_3dgs_fused_fwd(
+        radii, means2d, depths, conics, compensations = _make_lazy_cuda_func(
+            "projection_ewa_3dgs_fused_fwd"
+        )(
             means,
             covars,
             quats,
@@ -1564,7 +1723,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             far_plane,
             radius_clip,
             calc_compensations,
-            camera_model,
+            camera_model_type,
         )
         if not calc_compensations:
             compensations = None
@@ -1597,9 +1756,149 @@ class _FullyFusedProjection(torch.autograd.Function):
         height = ctx.height
         eps2d = ctx.eps2d
         camera_model = ctx.camera_model
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         if v_compensations is not None:
             v_compensations = v_compensations.contiguous()
         # v_means2d = v_means2d + (v_radii.sum() * 0)
+        v_means, v_covars, v_quats, v_scales, v_viewmats = _make_lazy_cuda_func(
+            "projection_ewa_3dgs_fused_bwd"
+        )(
+            means,
+            covars,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            width,
+            height,
+            eps2d,
+            camera_model_type,
+            radii,
+            conics,
+            compensations,
+            v_means2d.contiguous(),
+            v_depths.contiguous(),
+            v_conics.contiguous(),
+            v_compensations,
+            ctx.needs_input_grad[4],  # viewmats_requires_grad
+        )
+        if not ctx.needs_input_grad[0]:
+            v_means = None
+        if not ctx.needs_input_grad[1]:
+            v_covars = None
+        if not ctx.needs_input_grad[2]:
+            v_quats = None
+        if not ctx.needs_input_grad[3]:
+            v_scales = None
+        if not ctx.needs_input_grad[4]:
+            v_viewmats = None
+        if v_means is None:
+            v_means = torch.zeros_like(means, device=means.device)
+        if v_covars is None and covars is not None:
+            v_covars = torch.zeros_like(covars, device=covars.device)
+        if v_quats is None:
+            v_quats = torch.zeros_like(quats, device=quats.device)
+        if v_scales is None:
+            v_scales = torch.zeros_like(scales, device=scales.device)
+        if v_viewmats is None:
+            v_viewmats = torch.zeros_like(viewmats, device=viewmats.device)
+        v_Ks = torch.zeros_like(Ks, device=Ks.device)
+        return (
+            v_means,
+            v_covars,
+            v_quats,
+            v_scales,
+            v_viewmats,
+            v_Ks,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+class _FullyFusedProjectionCompiled(torch.autograd.Function):
+    """Projects Gaussians to 2D (torch.compile-friendly via custom ops)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means: Tensor,  # [..., N, 3]
+        covars: Tensor,  # [..., N, 6] or None
+        quats: Tensor,  # [..., N, 4] or None
+        scales: Tensor,  # [..., N, 3] or None
+        viewmats: Tensor,  # [..., C, 4, 4]
+        Ks: Tensor,  # [..., C, 3, 3]
+        width: int,
+        height: int,
+        eps2d: float,
+        near_plane: float,
+        far_plane: float,
+        radius_clip: float,
+        calc_compensations: bool,
+        camera_model: Literal["pinhole", "ortho", "fisheye", "ftheta"] = "pinhole",
+        opacities: Optional[Tensor] = None,  # [..., N] or None
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        assert (
+            camera_model != "ftheta"
+        ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
+
+        radii, means2d, depths, conics, compensations = projection_ewa_3dgs_fused_fwd(
+            means,
+            covars,
+            quats,
+            scales,
+            opacities,
+            viewmats,
+            Ks,
+            width,
+            height,
+            eps2d,
+            near_plane,
+            far_plane,
+            radius_clip,
+            calc_compensations,
+            camera_model,
+        )
+        if not calc_compensations:
+            compensations = None
+        ctx.save_for_backward(
+            means, covars, quats, scales, viewmats, Ks, radii, conics, compensations
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.eps2d = eps2d
+        ctx.camera_model = camera_model
+        ctx.mark_non_differentiable(radii)
+        return radii, means2d, depths, conics, compensations
+
+    @staticmethod
+    def backward(ctx, v_radii, v_means2d, v_depths, v_conics, v_compensations):
+        (
+            means,
+            covars,
+            quats,
+            scales,
+            viewmats,
+            Ks,
+            radii,
+            conics,
+            compensations,
+        ) = ctx.saved_tensors
+        width = ctx.width
+        height = ctx.height
+        eps2d = ctx.eps2d
+        camera_model = ctx.camera_model
+        if v_compensations is not None:
+            v_compensations = v_compensations.contiguous()
         v_means, v_covars, v_quats, v_scales, v_viewmats = projection_ewa_3dgs_fused_bwd(
             means,
             covars,
@@ -1618,7 +1917,7 @@ class _FullyFusedProjection(torch.autograd.Function):
             v_depths.contiguous(),
             v_conics.contiguous(),
             v_compensations,
-            ctx.needs_input_grad[4],  # viewmats_requires_grad
+            ctx.needs_input_grad[4],
         )
         if not ctx.needs_input_grad[0]:
             v_means = None
@@ -1715,6 +2014,9 @@ def fully_fused_projection_with_ut(
     if viewmats_rs is not None:
         assert viewmats_rs.shape == batch_dims + (C, 4, 4), viewmats_rs.shape
 
+    camera_model_type = _make_lazy_cuda_obj(
+        f"CameraModelType.{camera_model.upper()}"
+    )
     radii, means2d, depths, conics, compensations = _make_lazy_cuda_func(
         "projection_ut_3dgs_fused"
     )(
@@ -1732,7 +2034,7 @@ def fully_fused_projection_with_ut(
         far_plane,
         radius_clip,
         calc_compensations,
-        camera_model,
+        camera_model_type,
         ut_params.to_cpp(),
         rolling_shutter.to_cpp(),
         radial_coeffs.contiguous() if radial_coeffs is not None else None,
@@ -1757,8 +2059,8 @@ class _RasterizeToPixels(torch.autograd.Function):
         conics: Tensor,  # [..., N, 3] or [nnz, 3]
         colors: Tensor,  # [..., N, channels] or [nnz, channels]
         opacities: Tensor,  # [..., N] or [nnz]
-        backgrounds: Tensor,  # [..., channels], Optional
-        masks: Tensor,  # [..., tile_height, tile_width], Optional
+        backgrounds: Optional[Tensor],  # [..., channels], Optional
+        masks: Optional[Tensor],  # [..., tile_height, tile_width], Optional
         width: int,
         height: int,
         tile_size: int,
@@ -1766,61 +2068,37 @@ class _RasterizeToPixels(torch.autograd.Function):
         flatten_ids: Tensor,  # [n_isects]
         absgrad: bool,
     ) -> Tuple[Tensor, Tensor]:
-        cpp_backgrounds = (
-            None
-            if getattr(backgrounds, "_is_gsplat_backgrounds_placeholder", False)
-            else backgrounds
-        )
-        cpp_masks = (
-            None
-            if getattr(masks, "_is_gsplat_masks_placeholder", False)
-            else masks
-        )
-        render_colors, render_alphas, last_ids = rasterize_to_pixels_3dgs_fwd(
+        render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
+            "rasterize_to_pixels_3dgs_fwd"
+        )(
             means2d,
             conics,
             colors,
             opacities,
-            cpp_backgrounds,
-            cpp_masks,
+            backgrounds,
+            masks,
             width,
             height,
             tile_size,
             isect_offsets,
             flatten_ids,
         )
-        # backgrounds and masks are always tensors here (call site passes placeholders if None).
-        backgrounds_saved = backgrounds
-        had_backgrounds = torch.tensor(
-            0.0 if getattr(backgrounds, "_is_gsplat_backgrounds_placeholder", False) else 1.0,
-            device=means2d.device,
-            dtype=means2d.dtype,
-        )
-        had_masks = torch.tensor(
-            0.0 if getattr(masks, "_is_gsplat_masks_placeholder", False) else 1.0,
-            device=means2d.device,
-            dtype=means2d.dtype,
-        )
         ctx.save_for_backward(
             means2d,
             conics,
             colors,
             opacities,
-            backgrounds_saved,
+            backgrounds,
             masks,
             isect_offsets,
             flatten_ids,
             render_alphas,
             last_ids,
-            had_backgrounds,
-            had_masks,
         )
         ctx.width = width
         ctx.height = height
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
-
-        # double to float
         render_alphas = render_alphas.float()
         return render_colors, render_alphas
 
@@ -1835,32 +2113,29 @@ class _RasterizeToPixels(torch.autograd.Function):
             conics,
             colors,
             opacities,
-            backgrounds_saved,
+            backgrounds,
             masks,
             isect_offsets,
             flatten_ids,
             render_alphas,
             last_ids,
-            had_backgrounds,
-            had_masks,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
-
         (
             v_means2d_abs,
             v_means2d,
             v_conics,
             v_colors,
             v_opacities,
-        ) = rasterize_to_pixels_3dgs_bwd(
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_3dgs_bwd")(
             means2d,
             conics,
             colors,
             opacities,
-            backgrounds_saved,
+            backgrounds,
             masks,
             width,
             height,
@@ -1875,24 +2150,165 @@ class _RasterizeToPixels(torch.autograd.Function):
         )
         if v_means2d_abs is None:
             v_means2d_abs = torch.zeros_like(means2d, device=means2d.device)
-
         if absgrad:
             means2d.absgrad = v_means2d_abs
+        if ctx.needs_input_grad[4] and backgrounds is not None:
+            v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(
+                dim=(-3, -2)
+            )
+        else:
+            v_backgrounds = None
+        return (
+            v_means2d,
+            v_conics,
+            v_colors,
+            v_opacities,
+            v_backgrounds,
+            None,  # v_masks
+            None,  # width
+            None,  # height
+            None,  # tile_size
+            None,  # isect_offsets
+            None,  # flatten_ids
+            None,  # absgrad
+        )
 
+
+class _RasterizeToPixelsCompiled(torch.autograd.Function):
+    """Rasterize gaussians (torch.compile-friendly via custom ops)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        means2d: Tensor,  # [..., N, 2] or [nnz, 2]
+        conics: Tensor,  # [..., N, 3] or [nnz, 3]
+        colors: Tensor,  # [..., N, channels] or [nnz, channels]
+        opacities: Tensor,  # [..., N] or [nnz]
+        backgrounds: Tensor,  # [..., channels]; zeros placeholder when has_backgrounds is False
+        masks: Tensor,  # [..., tile_height, tile_width]; zeros placeholder when has_masks is False
+        width: int,
+        height: int,
+        tile_size: int,
+        isect_offsets: Tensor,  # [..., tile_height, tile_width]
+        flatten_ids: Tensor,  # [n_isects]
+        absgrad: bool,
+        has_backgrounds: bool,
+        has_masks: bool,
+    ) -> Tuple[Tensor, Tensor]:
+        cpp_backgrounds = None if not has_backgrounds else backgrounds
+        cpp_masks = None if not has_masks else masks
+        render_colors, render_alphas, last_ids = rasterize_to_pixels_3dgs_fwd(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            cpp_backgrounds,
+            cpp_masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+        )
+        had_backgrounds = torch.tensor(
+            1.0 if has_backgrounds else 0.0,
+            device=means2d.device,
+            dtype=means2d.dtype,
+        )
+        had_masks = torch.tensor(
+            1.0 if has_masks else 0.0,
+            device=means2d.device,
+            dtype=means2d.dtype,
+        )
+        ctx.save_for_backward(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            had_backgrounds,
+            had_masks,
+        )
+        ctx.width = width
+        ctx.height = height
+        ctx.tile_size = tile_size
+        ctx.absgrad = absgrad
+        render_alphas = render_alphas.float()
+        return render_colors, render_alphas
+
+    @staticmethod
+    def backward(
+        ctx,
+        v_render_colors: Tensor,
+        v_render_alphas: Tensor,
+    ):
+        (
+            means2d,
+            conics,
+            colors,
+            opacities,
+            backgrounds,
+            masks,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            had_backgrounds,
+            had_masks,
+        ) = ctx.saved_tensors
+        width = ctx.width
+        height = ctx.height
+        tile_size = ctx.tile_size
+        absgrad = ctx.absgrad
+        # Pass None when backgrounds/masks were placeholders so the C++ backward
+        # behaves like the original (kernel skips tiles only when masks is non-null
+        # and mask[tile] is False; with a placeholder all-False mask every tile
+        # would be skipped and grads would stay zero).
+        cpp_backgrounds = None if had_backgrounds.item() == 0 else backgrounds
+        cpp_masks = None if had_masks.item() == 0 else masks
+        (
+            v_means2d_abs,
+            v_means2d,
+            v_conics,
+            v_colors,
+            v_opacities,
+        ) = rasterize_to_pixels_3dgs_bwd(
+            means2d,
+            conics,
+            colors,
+            opacities,
+            cpp_backgrounds,
+            cpp_masks,
+            width,
+            height,
+            tile_size,
+            isect_offsets,
+            flatten_ids,
+            render_alphas,
+            last_ids,
+            v_render_colors.contiguous(),
+            v_render_alphas.contiguous(),
+            absgrad,
+        )
+        if v_means2d_abs is None:
+            v_means2d_abs = torch.zeros_like(means2d, device=means2d.device)
+        if absgrad:
+            means2d.absgrad = v_means2d_abs
         if ctx.needs_input_grad[4] and had_backgrounds.item() != 0:
             v_backgrounds = (v_render_colors * (1.0 - render_alphas).float()).sum(
                 dim=(-3, -2)
             )
         else:
-            v_backgrounds = torch.zeros_like(backgrounds_saved, device=backgrounds_saved.device)
-        # Always return a tensor for v_masks so Inductor never sees None at index 27.
+            v_backgrounds = torch.zeros_like(backgrounds, device=backgrounds.device)
         v_masks = torch.zeros_like(masks, device=masks.device)
-        # Return tensors for Tensor inputs (isect_offsets, flatten_ids) so Inductor never sees None there.
-        # Grads for non-Tensor inputs (width, height, tile_size, absgrad) must be None per PyTorch.
         dev = means2d.device
         v_isect_offsets = torch.zeros_like(isect_offsets, device=dev)
         v_flatten_ids = torch.zeros_like(flatten_ids, device=dev)
-
         return (
             v_means2d,
             v_conics,
@@ -1900,12 +2316,12 @@ class _RasterizeToPixels(torch.autograd.Function):
             v_opacities,
             v_backgrounds,
             v_masks,
-            None,  # width (int)
-            None,  # height (int)
-            None,  # tile_size (int)
+            None,
+            None,
+            None,
             v_isect_offsets,
             v_flatten_ids,
-            None,  # absgrad (bool)
+            None,
         )
 
 
@@ -1948,6 +2364,9 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             else FThetaCameraDistortionParameters.to_cpp_default()
         )
 
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         render_colors, render_alphas, last_ids = _make_lazy_cuda_func(
             "rasterize_to_pixels_from_world_3dgs_fwd"
         )(
@@ -1964,7 +2383,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             viewmats,
             viewmats_rs,
             Ks,
-            camera_model,
+            camera_model_type,
             ut_params,
             rs_type,
             radial_coeffs,
@@ -2034,6 +2453,9 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         ut_params = ctx.ut_params
         rs_type = ctx.rs_type
         camera_model = ctx.camera_model
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         tile_size = ctx.tile_size
         ftheta_coeffs = ctx.ftheta_coeffs
 
@@ -2053,7 +2475,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             viewmats,
             viewmats_rs,
             Ks,
-            camera_model,
+            camera_model_type,
             ut_params,
             rs_type,
             radial_coeffs,
@@ -2131,6 +2553,9 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
             camera_model != "ftheta"
         ), "ftheta camera is only supported via UT, please set with_ut=True in the rasterization()"
 
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         (
             indptr,
             batch_ids,
@@ -2156,7 +2581,7 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
             far_plane,
             radius_clip,
             calc_compensations,
-            camera_model,
+            camera_model_type,
         )
         if not calc_compensations:
             compensations = None
@@ -2223,6 +2648,9 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
 
         if v_compensations is not None:
             v_compensations = v_compensations.contiguous()
+        camera_model_type = _make_lazy_cuda_obj(
+            f"CameraModelType.{camera_model.upper()}"
+        )
         v_means, v_covars, v_quats, v_scales, v_viewmats = _make_lazy_cuda_func(
             "projection_ewa_3dgs_packed_bwd"
         )(
@@ -2235,7 +2663,7 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
             width,
             height,
             eps2d,
-            camera_model,
+            camera_model_type,
             batch_ids,
             camera_ids,
             gaussian_ids,
@@ -2322,6 +2750,40 @@ class _FullyFusedProjectionPacked(torch.autograd.Function):
 
 class _SphericalHarmonics(torch.autograd.Function):
     """Spherical Harmonics"""
+
+    @staticmethod
+    def forward(
+        ctx, sh_degree: int, dirs: Tensor, coeffs: Tensor, masks: Optional[Tensor]
+    ) -> Tensor:
+        colors = _make_lazy_cuda_func("spherical_harmonics_fwd")(
+            sh_degree, dirs, coeffs, masks
+        )
+        ctx.save_for_backward(dirs, coeffs, masks)
+        ctx.sh_degree = sh_degree
+        ctx.num_bases = coeffs.shape[-2]
+        return colors
+
+    @staticmethod
+    def backward(ctx, v_colors: Tensor):
+        dirs, coeffs, masks = ctx.saved_tensors
+        num_bases = ctx.num_bases
+        compute_v_dirs = ctx.needs_input_grad[1]
+        v_coeffs, v_dirs = _make_lazy_cuda_func("spherical_harmonics_bwd")(
+            num_bases,
+            ctx.sh_degree,
+            dirs,
+            coeffs,
+            masks,
+            v_colors.contiguous(),
+            compute_v_dirs,
+        )
+        if not compute_v_dirs:
+            v_dirs = None
+        return None, v_dirs, v_coeffs, None  # v_masks
+
+
+class _SphericalHarmonicsCompiled(torch.autograd.Function):
+    """Spherical Harmonics (torch.compile-friendly via custom ops)."""
 
     @staticmethod
     def forward(
